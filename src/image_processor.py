@@ -98,6 +98,64 @@ class ImageProcessor:
         bottom = top + crop_h
         return left, top, right, bottom
 
+    def adjust_crop_rect_to_aspect(
+        self,
+        crop_rect: Tuple[int, int, int, int],
+        preset_info: Optional[Tuple[str, Tuple[int, int]]],
+    ) -> Tuple[int, int, int, int]:
+        """指定比率の最大枠サイズ (target_w, target_h) を維持し、画面内にクランプして厳密な矩形を返す。
+
+        Args:
+            crop_rect: 元画像座標系での切り抜き矩形 (l, t, r, b)
+            preset_info: プリセット情報
+
+        Returns:
+            Tuple[int, int, int, int]: 補正後の切り抜き矩形 (l, t, r, b)
+        """
+        if preset_info is None or self.orig_w == 0 or self.orig_h == 0:
+            return crop_rect
+
+        mode, values = preset_info
+        if mode != "ratio":
+            return crop_rect
+
+        # ターゲット比率での元画像内切り抜きサイズを取得
+        target_w, target_h = self.get_crop_size_for_preset(preset_info)
+
+        l, t, _, _ = crop_rect
+        l = max(0, min(self.orig_w - target_w, l))
+        t = max(0, min(self.orig_h - target_h, t))
+        return l, t, l + target_w, t + target_h
+
+    @staticmethod
+    def calc_output_size(
+        crop_w: int,
+        crop_h: int,
+        max_long_edge: Optional[int],
+    ) -> Tuple[int, int]:
+        """切り抜き枠サイズと長辺上限設定から、最終保存サイズ (幅, 高さ) を算出する。
+
+        Args:
+            crop_w: クロップ幅px
+            crop_h: クロップ高さpx
+            max_long_edge: 出力画像の長辺上限px (Noneの場合は縮小なし)
+
+        Returns:
+            Tuple[int, int]: 最終保存画像の (幅, 高さ)
+        """
+        if crop_w <= 0 or crop_h <= 0:
+            return 0, 0
+        if max_long_edge is not None and max(crop_w, crop_h) > max_long_edge:
+            if crop_w >= crop_h:
+                new_w = max_long_edge
+                new_h = int(round(crop_h * (max_long_edge / crop_w)))
+            else:
+                new_h = max_long_edge
+                new_w = int(round(crop_w * (max_long_edge / crop_h)))
+            return new_w, new_h
+        return crop_w, crop_h
+
+
     def get_preview_image(
         self,
         max_size: Tuple[int, int] = (620, 560),

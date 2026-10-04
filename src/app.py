@@ -6,7 +6,7 @@ from tkinter import ttk, filedialog, messagebox
 from typing import Optional, Tuple
 from PIL import ImageTk
 
-from .presets import RATIO_PRESETS, OUTPUT_SIZE_PRESETS
+from .presets import RATIO_PRESETS, OUTPUT_SIZE_PRESETS, PRESET_DEFAULT_OUTPUT_SIZE
 from .image_processor import ImageProcessor
 
 
@@ -161,8 +161,9 @@ class PhotoEditorApp:
         # 出力解像度（長辺上限）
         ttk.Label(sidebar, text="出力サイズ (長辺上限):").pack(anchor=tk.W, pady=(2, 2))
         self.combo_size = ttk.Combobox(sidebar, values=list(OUTPUT_SIZE_PRESETS.keys()), state="readonly", font=("Helvetica", 9))
-        self.combo_size.current(0)  # 長辺 1080px (Instagram / 標準推奨)
+        self.combo_size.current(0)  # 長辺 1080px (Instagram 標準推奨)
         self.combo_size.pack(fill=tk.X, pady=(0, 8))
+        self.combo_size.bind("<<ComboboxSelected>>", self._on_size_changed)
 
         f_q = ttk.Frame(sidebar)
         f_q.pack(fill=tk.X, pady=2)
@@ -222,7 +223,7 @@ class PhotoEditorApp:
             messagebox.showerror("エラー", f"画像の読み込みに失敗しました:\n{e}")
 
     def _reset_all_params(self) -> None:
-        """補正スライダーおよびクロップ枠を初期値にリセット"""
+        """補正スライダー、クロップ枠、出力サイズ設定を初期値にリセット"""
         self.scale_bright.set(1.0)
         self.scale_contrast.set(1.0)
         self.scale_color.set(1.0)
@@ -230,8 +231,14 @@ class PhotoEditorApp:
         self.lbl_val_contrast.config(text="1.00")
         self.lbl_val_color.config(text="1.00")
 
+        # 現在選択中のSNS比率に応じた推奨出力サイズに初期化
+        preset_name = self.combo_ratio.get()
+        default_size_key = PRESET_DEFAULT_OUTPUT_SIZE.get(preset_name, list(OUTPUT_SIZE_PRESETS.keys())[0])
+        self.combo_size.set(default_size_key)
+
         self._recalc_initial_crop_box()
         self._render_canvas(apply_adjustments=False)
+        self._update_status_size()
 
     def _recalc_initial_crop_box(self) -> None:
         """現在の選択プリセットに基づいてプレビュー内の中央クロップ枠を計算"""
@@ -255,21 +262,47 @@ class PhotoEditorApp:
             self.crop_box = (left, top, left + prev_box_w, top + prev_box_h)
 
     def _on_ratio_changed(self, event=None) -> None:
-        """クロッププリセットコンボボックス変更時の処理"""
+        """クロッププリセットコンボボックス変更時の処理（出力サイズを自動連動）"""
         if self.processor.original_image is None:
             return
+
+        preset_name = self.combo_ratio.get()
+
+        # SNS比率に対応する推奨出力サイズに自動連動
+        default_size_key = PRESET_DEFAULT_OUTPUT_SIZE.get(preset_name)
+        if default_size_key and default_size_key in OUTPUT_SIZE_PRESETS:
+            self.combo_size.set(default_size_key)
+
         self._recalc_initial_crop_box()
         self._draw_overlay()
-        preset_name = self.combo_ratio.get()
-        preset_info = RATIO_PRESETS.get(preset_name, None)
+        self._update_status_size()
 
-        # 固定枠の場合は出力サイズ設定を「元解像度のまま」に自動で合わせる案内
-        if preset_info and preset_info[0] == "fixed":
-            target_w, target_h = preset_info[1]
-            self.combo_size.set("元解像度のまま (縮小なし)")
-            self.lbl_status.config(text=f"推奨固定枠「{target_w}×{target_h} px」を配置しました。ドラッグで位置を合わせて「元解像度のまま」保存できます。")
-        else:
-            self.lbl_status.config(text=f"切り抜き枠を「{preset_name}」に変更しました。枠内をドラッグして位置を調整できます。")
+    def _on_size_changed(self, event=None) -> None:
+        """出力サイズコンボボックス手動変更時の処理"""
+        if self.processor.original_image is not None:
+            self._draw_overlay()
+            self._update_status_size()
+
+    def _update_status_size(self) -> None:
+        """現在の切り抜きサイズと最終保存サイズをステータスバーに反映"""
+        if self.processor.original_image is None or self.crop_box is None or self.preview_scale <= 0:
+            return
+        cl, ct, cr, cb = self.crop_box
+        orig_w = int(round((cr - cl) / self.preview_scale))
+        orig_h = int(round((cb - ct) / self.preview_scale))
+
+        preset_name = self.combo_ratio.get()
+        preset_info = RATIO_PRESETS.get(preset_name)
+        l, t, r, b = self.processor.adjust_crop_rect_to_aspect((0, 0, orig_w, orig_h), preset_info)
+        cw, ch = r - l, b - t
+
+        size_key = self.combo_size.get()
+        max_edge = OUTPUT_SIZE_PRESETS.get(size_key)
+        out_w, out_h = self.processor.calc_output_size(cw, ch, max_edge)
+
+        self.lbl_status.config(
+            text=f"【{preset_name}】 構図: {cw}×{ch} px ➡ 最終保存サイズ: {out_w}×{out_h} px ({size_key})"
+        )
 
     def _on_apply_adjustments(self) -> None:
         """「適用」ボタン押下時: 色調補正をプレビューに反映"""
@@ -399,20 +432,35 @@ class PhotoEditorApp:
         # 3. クロップ外枠線
         self.canvas.create_rectangle(x1, y1, x2, y2, outline="#00ffcc", width=2, tags="crop_overlay")
 
-        # 4. クロップ枠の元画像実サイズ (px) のラベル表示
+        # 4. クロップ枠の元画像実サイズと最終保存サイズバッジ表示
         if self.preview_scale > 0:
             actual_w = int(round((cr - cl) / self.preview_scale))
             actual_h = int(round((cb - ct) / self.preview_scale))
-            size_text = f" {actual_w} × {actual_h} px "
-            
+
+            # アスペクト比厳密補正
+            preset_name = self.combo_ratio.get()
+            preset_info = RATIO_PRESETS.get(preset_name)
+            _, _, adj_w, adj_h = self.processor.adjust_crop_rect_to_aspect((0, 0, actual_w, actual_h), preset_info)
+
+            # 最終出力サイズの算出
+            size_key = self.combo_size.get()
+            max_edge = OUTPUT_SIZE_PRESETS.get(size_key)
+            out_w, out_h = self.processor.calc_output_size(adj_w, adj_h, max_edge)
+
+            if adj_w == out_w and adj_h == out_h:
+                size_text = f" {out_w} × {out_h} px "
+            else:
+                size_text = f" 構図: {adj_w}×{adj_h} px ➡ 保存: {out_w}×{out_h} px "
+
             # 枠上部または枠内にバッジ表示
-            tag_y = y1 - 10 if y1 >= 20 else y1 + 12
+            tag_y = y1 - 12 if y1 >= 24 else y1 + 14
+            badge_width = len(size_text) * 7.5 + 8
             self.canvas.create_rectangle(
-                x1, tag_y - 9, x1 + len(size_text) * 7.5, tag_y + 9,
+                x1, tag_y - 10, x1 + badge_width, tag_y + 10,
                 fill="#1e1e1e", outline="#00ffcc", width=1, tags="crop_overlay"
             )
             self.canvas.create_text(
-                x1 + 4, tag_y, text=size_text, fill="#00ffcc",
+                x1 + 6, tag_y, text=size_text, fill="#00ffcc",
                 anchor=tk.W, font=("Helvetica", 9, "bold"), tags="crop_overlay"
             )
 
@@ -495,7 +543,11 @@ class PhotoEditorApp:
             orig_right = int(round(cr / self.preview_scale))
             orig_bottom = int(round(cb / self.preview_scale))
 
-            crop_rect = (orig_left, orig_top, orig_right, orig_bottom)
+            raw_rect = (orig_left, orig_top, orig_right, orig_bottom)
+            # アスペクト比の厳密補正（微小な丸め誤差を除去）
+            preset_name = self.combo_ratio.get()
+            preset_info = RATIO_PRESETS.get(preset_name)
+            crop_rect = self.processor.adjust_crop_rect_to_aspect(raw_rect, preset_info)
             bright = float(self.scale_bright.get())
             contrast = float(self.scale_contrast.get())
             color = float(self.scale_color.get())
