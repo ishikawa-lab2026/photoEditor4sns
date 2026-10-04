@@ -53,7 +53,25 @@ class ImageProcessor:
 
         mode, values = preset_info
 
-        if mode == "fixed":
+        if mode == "zoom":
+            # 3倍ズーム枠（指定ピクセルサイズ）
+            target_w, target_h = values
+            # 元画像の幅または高さが指定ピクセルより小さい場合は、比率を維持して元画像内に収まる最大枠へ安全クランプ
+            if target_w > self.orig_w or target_h > self.orig_h:
+                target_aspect = target_w / target_h
+                current_aspect = self.orig_w / self.orig_h
+                if current_aspect > target_aspect:
+                    crop_h = self.orig_h
+                    crop_w = int(round(crop_h * target_aspect))
+                else:
+                    crop_w = self.orig_w
+                    crop_h = int(round(crop_w / target_aspect))
+                crop_w = min(self.orig_w, max(1, crop_w))
+                crop_h = min(self.orig_h, max(1, crop_h))
+                return crop_w, crop_h
+            return target_w, target_h
+
+        elif mode == "fixed":
             # SNS推奨固定ピクセルサイズ（元画像サイズを上限にクランプ）
             target_w, target_h = values
             crop_w = min(self.orig_w, target_w)
@@ -103,7 +121,7 @@ class ImageProcessor:
         crop_rect: Tuple[int, int, int, int],
         preset_info: Optional[Tuple[str, Tuple[int, int]]],
     ) -> Tuple[int, int, int, int]:
-        """指定比率の最大枠サイズ (target_w, target_h) を維持し、画面内にクランプして厳密な矩形を返す。
+        """指定プリセットの枠サイズ (target_w, target_h) を維持し、画面内にクランプして厳密な矩形を返す。
 
         Args:
             crop_rect: 元画像座標系での切り抜き矩形 (l, t, r, b)
@@ -115,8 +133,8 @@ class ImageProcessor:
         if preset_info is None or self.orig_w == 0 or self.orig_h == 0:
             return crop_rect
 
-        mode, values = preset_info
-        if mode != "ratio":
+        mode, _ = preset_info
+        if mode not in ("ratio", "zoom"):
             return crop_rect
 
         # ターゲット比率での元画像内切り抜きサイズを取得
