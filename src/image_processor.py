@@ -1,7 +1,10 @@
 """Pillow による画像読み込み・補正・クロップ・Exif除去保存モジュール
 """
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from PIL import Image, ImageOps, ImageEnhance
+
+# プレビュー用キャッシュ画像の長辺上限px（4Kモニタでも十分な解像度）
+PREVIEW_CACHE_LONG_EDGE = 2560
 
 
 class ImageProcessor:
@@ -9,6 +12,10 @@ class ImageProcessor:
 
     def __init__(self) -> None:
         self.original_image: Optional[Image.Image] = None
+        # プレビュー生成用の縮小キャッシュ（毎回フル解像度から縮小しないため）
+        self.preview_base: Optional[Image.Image] = None
+        # 色空間情報（ICCプロファイル）。個人情報を含まないため保存時に引き継ぐ
+        self.icc_profile: Optional[bytes] = None
         self.filepath: Optional[str] = None
         self.orig_w: int = 0
         self.orig_h: int = 0
@@ -22,15 +29,48 @@ class ImageProcessor:
         Returns:
             Tuple[int, int]: 元画像の (幅, 高さ)
         """
+        # with 文でファイルハンドルを確実に解放する（MPO等でのファイルロック防止）
+        with Image.open(filepath) as img:
+            img.load()
+            src_mode = img.mode
+            # RGB系の画像のみICCプロファイルを引き継ぐ（CMYK/グレー用プロファイルはRGB出力に不適合）
+            icc = img.info.get("icc_profile") if src_mode in ("RGB", "RGBA") else None
+            # スマホ撮影等のExif回転情報を反映して正しい向きに補正
+            transposed = ImageOps.exif_transpose(img)
+            image = self._to_rgb(transposed if transposed is not None else img)
+
         self.filepath = filepath
-        img = Image.open(filepath)
-        # スマホ撮影等のExif回転情報を反映して正しい向きに補正
-        self.original_image = ImageOps.exif_transpose(img)
-        # RGBモードに統一（PNG等のRGBAやCMYK対応）
-        if self.original_image.mode != "RGB":
-            self.original_image = self.original_image.convert("RGB")
-        self.orig_w, self.orig_h = self.original_image.size
+        self.icc_profile = icc or None
+        self.original_image = image
+        self.orig_w, self.orig_h = image.size
+
+        # プレビュー用の縮小キャッシュを一度だけ生成
+        base = image.copy()
+        base.thumbnail((PREVIEW_CACHE_LONG_EDGE, PREVIEW_CACHE_LONG_EDGE), Image.Resampling.LANCZOS)
+        self.preview_base = base
         return self.orig_w, self.orig_h
+
+    @staticmethod
+    def _to_rgb(img: Image.Image) -> Image.Image:
+        """任意モードの画像をRGBへ変換する。透過部分は白背景に合成する。
+
+        Args:
+            img: 変換対象画像
+
+        Returns:
+            Image.Image: RGB画像
+        """
+        has_alpha = img.mode in ("RGBA", "LA", "PA") or (
+            img.mode == "P" and "transparency" in img.info
+        )
+        if has_alpha:
+            rgba = img.convert("RGBA")
+            background = Image.new("RGB", rgba.size, (255, 255, 255))
+            background.paste(rgba, mask=rgba.getchannel("A"))
+            return background
+        if img.mode != "RGB":
+            return img.convert("RGB")
+        return img.copy()
 
     def get_crop_size_for_preset(
         self,
@@ -199,10 +239,14 @@ class ImageProcessor:
 
         max_w, max_h = max_size
         scale = min(max_w / self.orig_w, max_h / self.orig_h, 1.0)
-        prev_w = int(round(self.orig_w * scale))
-        prev_h = int(round(self.orig_h * scale))
+        prev_w = max(1, int(round(self.orig_w * scale)))
+        prev_h = max(1, int(round(self.orig_h * scale)))
 
-        preview_img = self.original_image.resize((prev_w, prev_h), Image.Resampling.BILINEAR)
+        # 縮小キャッシュで足りる場合はキャッシュから、足りない場合のみ元画像から縮小
+        source = self.preview_base
+        if source is None or prev_w > source.width or prev_h > source.height:
+            source = self.original_image
+        preview_img = source.resize((prev_w, prev_h), Image.Resampling.BILINEAR)
 
         if apply_adjustments:
             preview_img = self.apply_adjustments(preview_img, brightness, contrast, color)
@@ -277,14 +321,10 @@ class ImageProcessor:
         adjusted = self.apply_adjustments(cropped, brightness, contrast, color)
 
         # 3. SNS向け長辺リサイズ（元サイズが上限より大きい場合のみ高品質縮小）
+        #    サイズ計算はバッジ表示と共通の calc_output_size を使い、表示と結果のズレを防ぐ
         cur_w, cur_h = adjusted.size
-        if max_long_edge is not None and max(cur_w, cur_h) > max_long_edge:
-            if cur_w >= cur_h:
-                new_w = max_long_edge
-                new_h = int(round(cur_h * (max_long_edge / cur_w)))
-            else:
-                new_h = max_long_edge
-                new_w = int(round(cur_w * (max_long_edge / cur_h)))
+        new_w, new_h = self.calc_output_size(cur_w, cur_h, max_long_edge)
+        if (new_w, new_h) != (cur_w, cur_h):
             adjusted = adjusted.resize((new_w, new_h), Image.Resampling.LANCZOS)
 
         final_w, final_h = adjusted.size
@@ -293,6 +333,9 @@ class ImageProcessor:
         clean_img = Image.new("RGB", (final_w, final_h))
         clean_img.paste(adjusted)
 
-        # 5. JPEG保存（Exifメタデータを含めず保存）
-        clean_img.save(output_path, format="JPEG", quality=quality, optimize=True)
+        # 5. JPEG保存（Exifは含めず、色再現のためICCプロファイルのみ引き継ぐ）
+        save_kwargs: Dict[str, Any] = {"quality": quality, "optimize": True}
+        if self.icc_profile:
+            save_kwargs["icc_profile"] = self.icc_profile
+        clean_img.save(output_path, format="JPEG", **save_kwargs)
         return final_w, final_h

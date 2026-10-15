@@ -2,12 +2,18 @@
 """
 import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+from tkinter import ttk, filedialog, messagebox, font as tkfont
 from typing import Optional, Tuple
 from PIL import ImageTk
 
-from .presets import RATIO_PRESETS, OUTPUT_SIZE_PRESETS, PRESET_DEFAULT_OUTPUT_SIZE
+from .presets import CROP_PRESETS, OUTPUT_SIZE_PRESETS, PRESET_DEFAULT_OUTPUT_SIZE
 from .image_processor import ImageProcessor
+
+# 日本語表示に適したUIフォントの優先順位（先頭から利用可能なものを採用）
+UI_FONT_CANDIDATES = ("Yu Gothic UI", "Meiryo UI", "Segoe UI")
+
+# リサイズ完了とみなすまでの待機時間（ミリ秒）
+RESIZE_DEBOUNCE_MS = 150
 
 
 class PhotoEditorApp:
@@ -39,11 +45,34 @@ class PhotoEditorApp:
         self.drag_box_orig: Optional[Tuple[float, float, float, float]] = None
         self.is_dragging: bool = False
 
+        # プレビューに適用済みの補正値 (明るさ, コントラスト, 彩度: -1.00〜1.00, 基準 0.00)
+        # 再描画・保存は常にこの値を使い、プレビューと保存結果を一致させる
+        self.applied_adj: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+        # リサイズ再描画のデバウンス用ジョブID
+        self._resize_job: Optional[str] = None
+
+        # 日本語表示向けUIフォントの選択
+        self.ui_font = self._pick_ui_font()
+
         # スタイルの設定
         self._setup_style()
 
         # UIコンポーネントの構築
         self._create_widgets()
+
+    @staticmethod
+    def _ui_to_factor(val: float) -> float:
+        """UI上の補正値 (-1.00〜1.00, 基準 0.00) を Pillow ImageEnhance の倍率 (0.00〜2.00, 基準 1.00) に変換"""
+        return max(0.0, min(2.0, 1.0 + val))
+
+    def _pick_ui_font(self) -> str:
+        """利用可能な日本語向けUIフォント名を返す（見つからなければTk標準）"""
+        families = set(tkfont.families(self.root))
+        for name in UI_FONT_CANDIDATES:
+            if name in families:
+                return name
+        return "TkDefaultFont"
 
     def _setup_style(self) -> None:
         """ttk ウィジェットの共通スタイル設定"""
@@ -52,10 +81,13 @@ class PhotoEditorApp:
         if "clam" in self.style.theme_names():
             self.style.theme_use("clam")
 
-        self.style.configure("Header.TLabel", font=("Helvetica", 11, "bold"))
-        self.style.configure("Status.TLabel", font=("Helvetica", 9))
-        self.style.configure("Action.TButton", font=("Helvetica", 10, "bold"))
-        self.style.configure("Primary.TButton", font=("Helvetica", 11, "bold"))
+        f = self.ui_font
+        self.style.configure(".", font=(f, 9))
+        self.style.configure("Header.TLabel", font=(f, 11, "bold"))
+        self.style.configure("Status.TLabel", font=(f, 9))
+        self.style.configure("Pending.TLabel", font=(f, 9, "bold"), foreground="#d97706")
+        self.style.configure("Action.TButton", font=(f, 10, "bold"))
+        self.style.configure("Primary.TButton", font=(f, 11, "bold"))
 
     def _create_widgets(self) -> None:
         """GUI ウィジェット全体の配置"""
@@ -66,10 +98,10 @@ class PhotoEditorApp:
         self.btn_open = ttk.Button(top_bar, text="📁 画像を開く (JPEG)", command=self._on_open_image)
         self.btn_open.pack(side=tk.LEFT, padx=(0, 10))
 
-        self.lbl_file_info = ttk.Label(top_bar, text="画像が選択されていません", font=("Helvetica", 10))
+        self.lbl_file_info = ttk.Label(top_bar, text="画像が選択されていません", font=(self.ui_font, 10))
         self.lbl_file_info.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
-        self.lbl_orig_size = ttk.Label(top_bar, text="", font=("Helvetica", 9))
+        self.lbl_orig_size = ttk.Label(top_bar, text="", font=(self.ui_font, 9))
         self.lbl_orig_size.pack(side=tk.RIGHT, padx=5)
 
         ttk.Separator(self.root, orient=tk.HORIZONTAL).pack(side=tk.TOP, fill=tk.X)
@@ -80,6 +112,10 @@ class PhotoEditorApp:
 
         self.lbl_status = ttk.Label(self.status_bar, text="準備完了 - 「画像を開く」ボタンから写真を読み込んでください。", style="Status.TLabel")
         self.lbl_status.pack(side=tk.LEFT)
+
+        # 未適用の補正値があることを示すインジケータ
+        self.lbl_pending = ttk.Label(self.status_bar, text="", style="Pending.TLabel")
+        self.lbl_pending.pack(side=tk.RIGHT)
 
         # 3. メイン作業領域（左右分割）
         main_pane = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
@@ -95,6 +131,10 @@ class PhotoEditorApp:
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_motion)
         self.canvas.bind("<ButtonRelease-1>", self._on_drag_end)
+        # 矢印キーで切り抜き枠を微調整（通常: 元画像1px / Shift併用: 10px）
+        for key, (dx, dy) in {"Left": (-1, 0), "Right": (1, 0), "Up": (0, -1), "Down": (0, 1)}.items():
+            self.canvas.bind(f"<{key}>", lambda e, dx=dx, dy=dy: self._on_nudge_crop(dx, dy))
+            self.canvas.bind(f"<Shift-{key}>", lambda e, dx=dx, dy=dy: self._on_nudge_crop(dx * 10, dy * 10))
 
         # 右ペイン: 操作サイドバー
         sidebar = ttk.Frame(main_pane, padding=(12, 6))
@@ -104,7 +144,7 @@ class PhotoEditorApp:
         lbl_ratio = ttk.Label(sidebar, text="【1】SNS アスペクト比", style="Header.TLabel")
         lbl_ratio.pack(anchor=tk.W, pady=(0, 4))
 
-        self.combo_ratio = ttk.Combobox(sidebar, values=list(RATIO_PRESETS.keys()), state="readonly", font=("Helvetica", 9))
+        self.combo_ratio = ttk.Combobox(sidebar, values=list(CROP_PRESETS.keys()), state="readonly", font=(self.ui_font, 9))
         self.combo_ratio.current(0)  # Instagram 1:1
         self.combo_ratio.pack(fill=tk.X, pady=(0, 12))
         self.combo_ratio.bind("<<ComboboxSelected>>", self._on_ratio_changed)
@@ -115,32 +155,16 @@ class PhotoEditorApp:
         lbl_adj = ttk.Label(sidebar, text="【2】画質・色調補正", style="Header.TLabel")
         lbl_adj.pack(anchor=tk.W, pady=(4, 4))
 
-        # 明るさ
-        f_b = ttk.Frame(sidebar)
-        f_b.pack(fill=tk.X, pady=2)
-        ttk.Label(f_b, text="明るさ (Brightness):").pack(side=tk.LEFT)
-        self.lbl_val_bright = ttk.Label(f_b, text="1.00", width=5, anchor=tk.E)
-        self.lbl_val_bright.pack(side=tk.RIGHT)
-        self.scale_bright = ttk.Scale(sidebar, from_=0.2, to=2.0, value=1.0, command=lambda v: self._update_slider_label(self.lbl_val_bright, v))
-        self.scale_bright.pack(fill=tk.X, pady=(0, 6))
-
-        # コントラスト
-        f_c = ttk.Frame(sidebar)
-        f_c.pack(fill=tk.X, pady=2)
-        ttk.Label(f_c, text="コントラスト (Contrast):").pack(side=tk.LEFT)
-        self.lbl_val_contrast = ttk.Label(f_c, text="1.00", width=5, anchor=tk.E)
-        self.lbl_val_contrast.pack(side=tk.RIGHT)
-        self.scale_contrast = ttk.Scale(sidebar, from_=0.2, to=2.0, value=1.0, command=lambda v: self._update_slider_label(self.lbl_val_contrast, v))
-        self.scale_contrast.pack(fill=tk.X, pady=(0, 6))
-
-        # 彩度
-        f_s = ttk.Frame(sidebar)
-        f_s.pack(fill=tk.X, pady=2)
-        ttk.Label(f_s, text="彩度 (Color/Saturation):").pack(side=tk.LEFT)
-        self.lbl_val_color = ttk.Label(f_s, text="1.00", width=5, anchor=tk.E)
-        self.lbl_val_color.pack(side=tk.RIGHT)
-        self.scale_color = ttk.Scale(sidebar, from_=0.0, to=2.0, value=1.0, command=lambda v: self._update_slider_label(self.lbl_val_color, v))
-        self.scale_color.pack(fill=tk.X, pady=(0, 10))
+        # 明るさ / コントラスト / 彩度（スライダー＋数値入力: 範囲 -1.0 〜 1.0、初期値 0.00）
+        self.scale_bright, self.spin_bright, self.var_bright = self._create_adjust_row(
+            sidebar, "明るさ (Brightness):", -1.0, 1.0, pady_bottom=6
+        )
+        self.scale_contrast, self.spin_contrast, self.var_contrast = self._create_adjust_row(
+            sidebar, "コントラスト (Contrast):", -1.0, 1.0, pady_bottom=6
+        )
+        self.scale_color, self.spin_color, self.var_color = self._create_adjust_row(
+            sidebar, "彩度 (Color/Saturation):", -1.0, 1.0, pady_bottom=10
+        )
 
         # ボタン群（適用 / リセット）
         btn_frame = ttk.Frame(sidebar)
@@ -160,7 +184,7 @@ class PhotoEditorApp:
 
         # 出力解像度（長辺上限）
         ttk.Label(sidebar, text="出力サイズ (長辺上限):").pack(anchor=tk.W, pady=(2, 2))
-        self.combo_size = ttk.Combobox(sidebar, values=list(OUTPUT_SIZE_PRESETS.keys()), state="readonly", font=("Helvetica", 9))
+        self.combo_size = ttk.Combobox(sidebar, values=list(OUTPUT_SIZE_PRESETS.keys()), state="readonly", font=(self.ui_font, 9))
         self.combo_size.current(0)  # 長辺 1080px (Instagram 標準推奨)
         self.combo_size.pack(fill=tk.X, pady=(0, 8))
         self.combo_size.bind("<<ComboboxSelected>>", self._on_size_changed)
@@ -186,18 +210,97 @@ class PhotoEditorApp:
         self.scale_bright.config(state=state)
         self.scale_contrast.config(state=state)
         self.scale_color.config(state=state)
+        self.spin_bright.config(state=state)
+        self.spin_contrast.config(state=state)
+        self.spin_color.config(state=state)
         self.scale_quality.config(state=state)
         self.btn_apply.config(state=state)
         self.btn_reset.config(state=state)
         self.btn_save.config(state=state)
 
-    def _update_slider_label(self, label: ttk.Label, val_str: str) -> None:
-        """スライダー数値をラベルに反映"""
+    def _create_adjust_row(
+        self,
+        parent: ttk.Frame,
+        label_text: str,
+        from_: float,
+        to: float,
+        pady_bottom: int,
+    ) -> Tuple[ttk.Scale, ttk.Spinbox, tk.StringVar]:
+        """補正項目1行分（ラベル・数値入力Spinbox・スライダー）を生成し、双方向に連動させる。
+
+        Args:
+            parent: 配置先フレーム
+            label_text: 項目ラベル
+            from_: 最小値
+            to: 最大値
+            pady_bottom: スライダー下側の余白
+
+        Returns:
+            Tuple[ttk.Scale, ttk.Spinbox, tk.StringVar]: (スライダー, Spinbox, 表示値変数)
+        """
+        row = ttk.Frame(parent)
+        row.pack(fill=tk.X, pady=2)
+        ttk.Label(row, text=label_text).pack(side=tk.LEFT)
+
+        var = tk.StringVar(value="0.00")
+        spin = ttk.Spinbox(
+            row, from_=from_, to=to, increment=0.01, width=6,
+            textvariable=var, format="%.2f", font=(self.ui_font, 9),
+        )
+        spin.pack(side=tk.RIGHT)
+
+        scale = ttk.Scale(
+            parent, from_=from_, to=to, value=0.0,
+            command=lambda v: self._on_slider_moved(var, v),
+        )
+        scale.pack(fill=tk.X, pady=(0, pady_bottom))
+
+        def commit(_event=None) -> None:
+            self._on_spin_commit(var, scale, from_, to)
+
+        spin.config(command=commit)
+        spin.bind("<Return>", commit)
+        spin.bind("<FocusOut>", commit)
+        return scale, spin, var
+
+    def _on_slider_moved(self, var: tk.StringVar, val_str: str) -> None:
+        """スライダー操作時: 数値欄へ反映し、未適用表示を更新"""
         try:
-            val = float(val_str)
-            label.config(text=f"{val:.2f}")
+            var.set(f"{float(val_str):.2f}")
         except ValueError:
-            pass
+            return
+        self._update_pending_indicator()
+
+    def _on_spin_commit(self, var: tk.StringVar, scale: ttk.Scale, from_: float, to: float) -> None:
+        """数値入力確定時: 範囲内に丸めてスライダーへ反映（不正値は元に戻す）"""
+        try:
+            val = float(var.get())
+        except ValueError:
+            var.set(f"{float(scale.get()):.2f}")
+            return
+        val = max(from_, min(to, val))
+        scale.set(val)
+        var.set(f"{val:.2f}")
+        self._update_pending_indicator()
+
+    def _current_adj(self) -> Tuple[float, float, float]:
+        """現在のスライダー値 (明るさ, コントラスト, 彩度) を小数2桁で返す"""
+        return (
+            round(float(self.scale_bright.get()), 2),
+            round(float(self.scale_contrast.get()), 2),
+            round(float(self.scale_color.get()), 2),
+        )
+
+    def _has_pending_adj(self) -> bool:
+        """プレビュー未適用の補正値があるか"""
+        return self._current_adj() != self.applied_adj
+
+    def _update_pending_indicator(self) -> None:
+        """未適用の補正値がある場合にステータスバーへ表示"""
+        if self.processor.original_image is not None and self._has_pending_adj():
+            self.lbl_pending.config(text="● 未適用の補正あり（「適用」で反映）")
+        else:
+            self.lbl_pending.config(text="")
 
     def _on_open_image(self) -> None:
         """ファイル選択ダイアログからJPEG画像を開く"""
@@ -224,20 +327,24 @@ class PhotoEditorApp:
 
     def _reset_all_params(self) -> None:
         """補正スライダー、クロップ枠、出力サイズ設定を初期値にリセット"""
-        self.scale_bright.set(1.0)
-        self.scale_contrast.set(1.0)
-        self.scale_color.set(1.0)
-        self.lbl_val_bright.config(text="1.00")
-        self.lbl_val_contrast.config(text="1.00")
-        self.lbl_val_color.config(text="1.00")
+        self.applied_adj = (0.0, 0.0, 0.0)
+        for scale, var in (
+            (self.scale_bright, self.var_bright),
+            (self.scale_contrast, self.var_contrast),
+            (self.scale_color, self.var_color),
+        ):
+            scale.set(0.0)
+            var.set("0.00")
+        self._update_pending_indicator()
 
         # 現在選択中のSNS比率に応じた推奨出力サイズに初期化
         preset_name = self.combo_ratio.get()
         default_size_key = PRESET_DEFAULT_OUTPUT_SIZE.get(preset_name, list(OUTPUT_SIZE_PRESETS.keys())[0])
         self.combo_size.set(default_size_key)
 
-        self._recalc_initial_crop_box()
-        self._render_canvas(apply_adjustments=False)
+        # クロップ枠を破棄し、描画時（新しいプレビュースケール確定後）に中央へ再配置させる
+        self.crop_box = None
+        self._render_canvas()
         self._update_status_size()
 
     def _recalc_initial_crop_box(self) -> None:
@@ -246,7 +353,7 @@ class PhotoEditorApp:
             return
 
         preset_key = self.combo_ratio.get()
-        preset_info = RATIO_PRESETS.get(preset_key, None)
+        preset_info = CROP_PRESETS.get(preset_key, None)
 
         if preset_info is None:
             # フリー / 元画像全体: プレビュー画像全体
@@ -254,8 +361,9 @@ class PhotoEditorApp:
         else:
             orig_crop_w, orig_crop_h = self.processor.get_crop_size_for_preset(preset_info)
             # 元画像のクロップサイズをプレビュー座標系にスケール変換
-            prev_box_w = orig_crop_w * self.preview_scale
-            prev_box_h = orig_crop_h * self.preview_scale
+            # （プレビュー寸法は整数丸めされるため、枠がはみ出さないよう上限をかける）
+            prev_box_w = min(orig_crop_w * self.preview_scale, float(self.prev_w))
+            prev_box_h = min(orig_crop_h * self.preview_scale, float(self.prev_h))
 
             left = (self.prev_w - prev_box_w) / 2.0
             top = (self.prev_h - prev_box_h) / 2.0
@@ -292,7 +400,7 @@ class PhotoEditorApp:
         orig_h = int(round((cb - ct) / self.preview_scale))
 
         preset_name = self.combo_ratio.get()
-        preset_info = RATIO_PRESETS.get(preset_name)
+        preset_info = CROP_PRESETS.get(preset_name)
         l, t, r, b = self.processor.adjust_crop_rect_to_aspect((0, 0, orig_w, orig_h), preset_info)
         cw, ch = r - l, b - t
 
@@ -305,10 +413,12 @@ class PhotoEditorApp:
         )
 
     def _on_apply_adjustments(self) -> None:
-        """「適用」ボタン押下時: 色調補正をプレビューに反映"""
+        """「適用」ボタン押下時: 現在の補正値を確定してプレビューに反映"""
         if self.processor.original_image is None:
             return
-        self._render_canvas(apply_adjustments=True)
+        self.applied_adj = self._current_adj()
+        self._render_canvas()
+        self._update_pending_indicator()
         self.lbl_status.config(text="色調補正をプレビューに反映しました。")
 
     def _on_reset_adjustments(self) -> None:
@@ -319,13 +429,20 @@ class PhotoEditorApp:
         self.lbl_status.config(text="補正値とクロップ枠を初期状態に戻しました。")
 
     def _on_canvas_resize(self, event) -> None:
-        """ウィンドウ・Canvasリサイズ時の再描画"""
-        if self.processor.original_image is not None:
-            # プレビューサイズをCanvasに合わせて再計算
-            self._render_canvas(apply_adjustments=False)
+        """ウィンドウ・Canvasリサイズ時: 連続イベントをまとめ、落ち着いてから再描画（デバウンス）"""
+        if self.processor.original_image is None:
+            return
+        if self._resize_job is not None:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(RESIZE_DEBOUNCE_MS, self._on_resize_settled)
 
-    def _render_canvas(self, apply_adjustments: bool = False) -> None:
-        """プレビュー画像とオーバーレイをCanvasに描画"""
+    def _on_resize_settled(self) -> None:
+        """リサイズ完了後の再描画"""
+        self._resize_job = None
+        self._render_canvas()
+
+    def _render_canvas(self) -> None:
+        """プレビュー画像（適用済み補正値を反映）とオーバーレイをCanvasに描画"""
         if self.processor.original_image is None:
             return
 
@@ -344,16 +461,14 @@ class PhotoEditorApp:
             l, t, r, b = self.crop_box
             norm_box = (l / self.prev_w, t / self.prev_h, r / self.prev_w, b / self.prev_h)
 
-        bright = float(self.scale_bright.get())
-        contrast = float(self.scale_contrast.get())
-        color = float(self.scale_color.get())
+        bright_ui, contrast_ui, color_ui = self.applied_adj
 
         prev_img, scale, pw, ph = self.processor.get_preview_image(
             max_size=(max_pw, max_ph),
-            brightness=bright,
-            contrast=contrast,
-            color=color,
-            apply_adjustments=apply_adjustments,
+            brightness=self._ui_to_factor(bright_ui),
+            contrast=self._ui_to_factor(contrast_ui),
+            color=self._ui_to_factor(color_ui),
+            apply_adjustments=True,
         )
         if prev_img is None:
             return
@@ -439,7 +554,7 @@ class PhotoEditorApp:
 
             # アスペクト比厳密補正
             preset_name = self.combo_ratio.get()
-            preset_info = RATIO_PRESETS.get(preset_name)
+            preset_info = CROP_PRESETS.get(preset_name)
             _, _, adj_w, adj_h = self.processor.adjust_crop_rect_to_aspect((0, 0, actual_w, actual_h), preset_info)
 
             # 最終出力サイズの算出
@@ -448,26 +563,31 @@ class PhotoEditorApp:
             out_w, out_h = self.processor.calc_output_size(adj_w, adj_h, max_edge)
 
             if adj_w == out_w and adj_h == out_h:
-                size_text = f" {out_w} × {out_h} px "
+                size_text = f"{out_w} × {out_h} px"
             else:
-                size_text = f" 構図: {adj_w}×{adj_h} px ➡ 保存: {out_w}×{out_h} px "
+                size_text = f"構図: {adj_w}×{adj_h} px ➡ 保存: {out_w}×{out_h} px"
 
-            # 枠上部または枠内にバッジ表示
+            # 枠上部または枠内にバッジ表示（テキストの実寸から背景矩形を描画）
             tag_y = y1 - 12 if y1 >= 24 else y1 + 14
-            badge_width = len(size_text) * 7.5 + 8
-            self.canvas.create_rectangle(
-                x1, tag_y - 10, x1 + badge_width, tag_y + 10,
-                fill="#1e1e1e", outline="#00ffcc", width=1, tags="crop_overlay"
+            text_id = self.canvas.create_text(
+                x1 + 8, tag_y, text=size_text, fill="#00ffcc",
+                anchor=tk.W, font=(self.ui_font, 9, "bold"), tags="crop_overlay"
             )
-            self.canvas.create_text(
-                x1 + 6, tag_y, text=size_text, fill="#00ffcc",
-                anchor=tk.W, font=("Helvetica", 9, "bold"), tags="crop_overlay"
-            )
+            bbox = self.canvas.bbox(text_id)
+            if bbox is not None:
+                bx1, by1, bx2, by2 = bbox
+                rect_id = self.canvas.create_rectangle(
+                    bx1 - 6, by1 - 2, bx2 + 6, by2 + 2,
+                    fill="#1e1e1e", outline="#00ffcc", width=1, tags="crop_overlay"
+                )
+                self.canvas.tag_lower(rect_id, text_id)
 
     # --- ドラッグによるクロップ枠移動イベント ---
 
     def _on_drag_start(self, event) -> None:
-        """マウスクリック時: ドラッグ開始座標を記録"""
+        """マウスクリック時: ドラッグ開始（枠外クリック時はその位置へ枠の中心を移動）"""
+        # 矢印キーによる微調整を受け付けるためCanvasにフォーカスを移す
+        self.canvas.focus_set()
         if self.crop_box is None:
             return
 
@@ -475,12 +595,19 @@ class PhotoEditorApp:
         cy = event.y - self.img_offset_y
         cl, ct, cr, cb = self.crop_box
 
-        # 枠内または枠近傍をクリックした場合にドラッグ開始
-        if cl <= cx <= cr and ct <= cy <= cb:
-            self.is_dragging = True
-            self.drag_start_x = cx
-            self.drag_start_y = cy
-            self.drag_box_orig = (cl, ct, cr, cb)
+        if not (cl <= cx <= cr and ct <= cy <= cb):
+            # 画像範囲外のクリックは無視
+            if not (0 <= cx <= self.prev_w and 0 <= cy <= self.prev_h):
+                return
+            box_w = cr - cl
+            box_h = cb - ct
+            self._move_crop_to(cx - box_w / 2.0, cy - box_h / 2.0)
+            self._draw_overlay()
+
+        self.is_dragging = True
+        self.drag_start_x = cx
+        self.drag_start_y = cy
+        self.drag_box_orig = self.crop_box
 
     def _on_drag_motion(self, event) -> None:
         """ドラッグ中: クロップ枠を画像表示範囲内に制限しながら移動"""
@@ -493,19 +620,29 @@ class PhotoEditorApp:
         dx = cx - self.drag_start_x
         dy = cy - self.drag_start_y
 
-        orig_l, orig_t, orig_r, orig_b = self.drag_box_orig
-        box_w = orig_r - orig_l
-        box_h = orig_b - orig_t
+        orig_l, orig_t, _, _ = self.drag_box_orig
+        self._move_crop_to(orig_l + dx, orig_t + dy)
+        self._draw_overlay()
 
-        new_l = orig_l + dx
-        new_t = orig_t + dy
-
-        # プレビュー画像範囲内 (0, 0, prev_w, prev_h) にクランプ
+    def _move_crop_to(self, new_l: float, new_t: float) -> None:
+        """クロップ枠を指定位置へ移動（プレビュー画像範囲内にクランプ）"""
+        if self.crop_box is None:
+            return
+        cl, ct, cr, cb = self.crop_box
+        box_w = cr - cl
+        box_h = cb - ct
         new_l = max(0.0, min(float(self.prev_w - box_w), new_l))
         new_t = max(0.0, min(float(self.prev_h - box_h), new_t))
-
         self.crop_box = (new_l, new_t, new_l + box_w, new_t + box_h)
+
+    def _on_nudge_crop(self, dx_orig: int, dy_orig: int) -> str:
+        """矢印キー押下時: 元画像のピクセル単位でクロップ枠を微調整"""
+        if self.crop_box is None or self.preview_scale <= 0:
+            return "break"
+        cl, ct, _, _ = self.crop_box
+        self._move_crop_to(cl + dx_orig * self.preview_scale, ct + dy_orig * self.preview_scale)
         self._draw_overlay()
+        return "break"
 
     def _on_drag_end(self, event) -> None:
         """ドラッグ終了"""
@@ -519,6 +656,20 @@ class PhotoEditorApp:
         if self.processor.original_image is None or self.crop_box is None:
             messagebox.showwarning("警告", "保存対象の写真がありません。")
             return
+
+        # 未適用の補正値がある場合は、プレビューと保存結果の食い違いを防ぐため確認する
+        if self._has_pending_adj():
+            answer = messagebox.askyesnocancel(
+                "未適用の補正があります",
+                "変更した補正値がプレビューに未適用です。\n\n"
+                "・はい: 適用してから保存\n"
+                "・いいえ: 現在のプレビュー（適用済みの補正）のまま保存\n"
+                "・キャンセル: 保存を中止",
+            )
+            if answer is None:
+                return
+            if answer:
+                self._on_apply_adjustments()
 
         orig_dir = os.path.dirname(self.processor.filepath) if self.processor.filepath else os.getcwd()
         orig_base = os.path.splitext(os.path.basename(self.processor.filepath))[0] if self.processor.filepath else "photo"
@@ -546,11 +697,10 @@ class PhotoEditorApp:
             raw_rect = (orig_left, orig_top, orig_right, orig_bottom)
             # アスペクト比の厳密補正（微小な丸め誤差を除去）
             preset_name = self.combo_ratio.get()
-            preset_info = RATIO_PRESETS.get(preset_name)
+            preset_info = CROP_PRESETS.get(preset_name)
             crop_rect = self.processor.adjust_crop_rect_to_aspect(raw_rect, preset_info)
-            bright = float(self.scale_bright.get())
-            contrast = float(self.scale_contrast.get())
-            color = float(self.scale_color.get())
+            # 保存はプレビューと同じ「適用済み」の補正値で行う（UI値 -> Pillow倍率に変換）
+            bright_ui, contrast_ui, color_ui = self.applied_adj
             quality = int(float(self.scale_quality.get()))
 
             # 出力サイズ（長辺上限）の取得
@@ -560,9 +710,9 @@ class PhotoEditorApp:
             final_w, final_h = self.processor.save_cropped_image(
                 output_path=save_path,
                 crop_rect=crop_rect,
-                brightness=bright,
-                contrast=contrast,
-                color=color,
+                brightness=self._ui_to_factor(bright_ui),
+                contrast=self._ui_to_factor(contrast_ui),
+                color=self._ui_to_factor(color_ui),
                 quality=quality,
                 max_long_edge=max_long_edge,
             )
