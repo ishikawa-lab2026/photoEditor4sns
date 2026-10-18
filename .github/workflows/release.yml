@@ -1,0 +1,61 @@
+name: Build and Release Windows EXE
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies and build EXE
+        run: |
+          uv run --with pyinstaller pyinstaller --noconsole --onefile --name "photoEditor4sns" main.py
+
+      - name: Create GitHub Release and Upload EXE
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "photoEditor4sns v0.1.0"
+          tag_name: ${{ github.ref_name }}
+          files: dist/photoEditor4sns.exe
+          body: |
+            ## photoEditor4sns v0.1.0
+
+            Instagram や X（旧Twitter）への投稿に特化した超軽量デスクトップ写真編集ツールの初版リリースです。
+
+            ### ダウンロード・起動方法 (Windows)
+            1. 下記の **`photoEditor4sns.exe`** をダウンロードします。
+            2. ダウンロードしたファイルをダブルクリックして起動します（Python のインストールは不要です）。
+
+            > **⚠️ 初回起動時のご注意（Windows SmartScreen）**
+            > 初回起動時に「Windows によって PC が保護されました」という青い警告画面が表示される場合があります。
+            > これはオープンソースソフトウェアで署名証明書がないため表示されるものです。
+            > **「詳細情報」** をクリックし、表示された **「実行」** ボタンを押すことで正常に起動できます。
+
+            ### 主な機能
+            - **Exif個人情報の自動削除 & ICCプロファイル（P3/sRGB）維持**
+            - **SNS推奨解像度自動連動クロップ（1:1, 4:5, 16:9, 3:1 等）**
+            - **高画素カメラ写真向け「3倍ズーム枠」切り抜き**
+            - **三分割法グリッド線 & 最終出力サイズバッジ表示**
+            - **マウスドラッグ & 矢印キー（1px/10px）による精密位置微調整**
+            - **明るさ・コントラスト・彩度補正（-1.00〜1.00、数値入力対応）**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
