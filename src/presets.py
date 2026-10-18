@@ -1,11 +1,10 @@
 """SNS向けアスペクト比 & 推奨サイズプリセット定義モジュール
 """
-from typing import Optional, Tuple, Dict, Any
 
 # クロッププリセット定義
 # キー: 表示ラベル
 # 値: ("ratio", (幅比率, 高さ比率)) または ("zoom", (幅px, 高さpx)) または None (全体)
-CROP_PRESETS: Dict[str, Optional[Tuple[str, Tuple[int, int]]]] = {
+CROP_PRESETS: dict[str, tuple[str, tuple[int, int]] | None] = {
     # --- Instagram ---
     "Instagram 1:1 (正方形・全体)": ("ratio", (1, 1)),
     "Instagram 1:1 (3倍枠 3240×3240)": ("zoom", (3240, 3240)),
@@ -27,7 +26,7 @@ CROP_PRESETS: Dict[str, Optional[Tuple[str, Tuple[int, int]]]] = {
 
 # 出力解像度（長辺上限）プリセット定義
 # キー: 表示ラベル, 値: 長辺ピクセル数 または None (縮小なし)
-OUTPUT_SIZE_PRESETS: Dict[str, Optional[int]] = {
+OUTPUT_SIZE_PRESETS: dict[str, int | None] = {
     "長辺 1080px (Instagram 標準推奨)": 1080,
     "長辺 1350px (Instagram 縦長4:5 推奨)": 1350,
     "長辺 1200px (X / Twitter 推奨)": 1200,
@@ -38,7 +37,7 @@ OUTPUT_SIZE_PRESETS: Dict[str, Optional[int]] = {
 }
 
 # 各SNSアスペクト比・テンプレートに対応する推奨出力サイズ（自動連動用）
-PRESET_DEFAULT_OUTPUT_SIZE: Dict[str, str] = {
+PRESET_DEFAULT_OUTPUT_SIZE: dict[str, str] = {
     # Instagram
     "Instagram 1:1 (正方形・全体)": "長辺 1080px (Instagram 標準推奨)",
     "Instagram 1:1 (3倍枠 3240×3240)": "長辺 1080px (Instagram 標準推奨)",

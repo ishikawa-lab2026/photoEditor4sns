@@ -2,6 +2,7 @@
 """
 import sys
 import tkinter as tk
+
 from src.app import PhotoEditorApp
 
 

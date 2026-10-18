@@ -47,6 +47,6 @@ def test_spec_output_size_for_preset(tmp_path: Path, preset_key, expected):
     p = ImageProcessor()
     p.load_image(str(src))
 
-    l, t, r, b = p.get_initial_crop_rect(CROP_PRESETS[preset_key])
+    left, top, right, bottom = p.get_initial_crop_rect(CROP_PRESETS[preset_key])
     max_edge = OUTPUT_SIZE_PRESETS[PRESET_DEFAULT_OUTPUT_SIZE[preset_key]]
-    assert ImageProcessor.calc_output_size(r - l, b - t, max_edge) == expected
+    assert ImageProcessor.calc_output_size(right - left, bottom - top, max_edge) == expected

@@ -2,12 +2,13 @@
 """
 import os
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, font as tkfont
-from typing import Optional, Tuple
+from tkinter import filedialog, messagebox, ttk
+from tkinter import font as tkfont
+
 from PIL import ImageTk
 
-from .presets import CROP_PRESETS, OUTPUT_SIZE_PRESETS, PRESET_DEFAULT_OUTPUT_SIZE
 from .image_processor import ImageProcessor
+from .presets import CROP_PRESETS, OUTPUT_SIZE_PRESETS, PRESET_DEFAULT_OUTPUT_SIZE
 
 # 日本語表示に適したUIフォントの優先順位（先頭から利用可能なものを採用）
 UI_FONT_CANDIDATES = ("Yu Gothic UI", "Meiryo UI", "Segoe UI")
@@ -28,7 +29,7 @@ class PhotoEditorApp:
         self.processor = ImageProcessor()
 
         # プレビュー管理変数
-        self.preview_tk_image: Optional[ImageTk.PhotoImage] = None
+        self.preview_tk_image: ImageTk.PhotoImage | None = None
         self.preview_scale: float = 1.0
         self.prev_w: int = 0
         self.prev_h: int = 0
@@ -37,20 +38,20 @@ class PhotoEditorApp:
 
         # クロップ枠（元画像座標系の整数px）: (left, top, right, bottom)
         # プレビュー座標は描画時にのみ算出し、丸め誤差の蓄積を防ぐ
-        self.crop_rect: Optional[Tuple[int, int, int, int]] = None
+        self.crop_rect: tuple[int, int, int, int] | None = None
 
         # ドラッグ移動管理（開始位置はプレビュー座標、開始時の枠は元画像座標）
         self.drag_start_x: float = 0.0
         self.drag_start_y: float = 0.0
-        self.drag_rect_start: Optional[Tuple[int, int, int, int]] = None
+        self.drag_rect_start: tuple[int, int, int, int] | None = None
         self.is_dragging: bool = False
 
         # プレビューに適用済みの補正値 (明るさ, コントラスト, 彩度: -1.00〜1.00, 基準 0.00)
         # 再描画・保存は常にこの値を使い、プレビューと保存結果を一致させる
-        self.applied_adj: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.applied_adj: tuple[float, float, float] = (0.0, 0.0, 0.0)
 
         # リサイズ再描画のデバウンス用ジョブID
-        self._resize_job: Optional[str] = None
+        self._resize_job: str | None = None
 
         # 日本語表示向けUIフォントの選択
         self.ui_font = self._pick_ui_font()
@@ -131,6 +132,8 @@ class PhotoEditorApp:
         self.canvas.bind("<ButtonPress-1>", self._on_drag_start)
         self.canvas.bind("<B1-Motion>", self._on_drag_motion)
         self.canvas.bind("<ButtonRelease-1>", self._on_drag_end)
+        # マウスカーソルがCanvasに入った際、矢印キー操作を受け付けるよう自動フォーカス
+        self.canvas.bind("<Enter>", lambda _e: self.canvas.focus_set())
         # 矢印キーで切り抜き枠を微調整（通常: 元画像1px / Shift併用: 10px）
         for key, (dx, dy) in {"Left": (-1, 0), "Right": (1, 0), "Up": (0, -1), "Down": (0, 1)}.items():
             self.canvas.bind(f"<{key}>", lambda e, dx=dx, dy=dy: self._on_nudge_crop(dx, dy))
@@ -225,7 +228,7 @@ class PhotoEditorApp:
         from_: float,
         to: float,
         pady_bottom: int,
-    ) -> Tuple[ttk.Scale, ttk.Spinbox, tk.StringVar]:
+    ) -> tuple[ttk.Scale, ttk.Spinbox, tk.StringVar]:
         """補正項目1行分（ラベル・数値入力Spinbox・スライダー）を生成し、双方向に連動させる。
 
         Args:
@@ -283,7 +286,7 @@ class PhotoEditorApp:
         var.set(f"{val:.2f}")
         self._update_pending_indicator()
 
-    def _current_adj(self) -> Tuple[float, float, float]:
+    def _current_adj(self) -> tuple[float, float, float]:
         """現在のスライダー値 (明るさ, コントラスト, 彩度) を小数2桁で返す"""
         return (
             round(float(self.scale_bright.get()), 2),
@@ -382,8 +385,8 @@ class PhotoEditorApp:
         """現在の切り抜きサイズと最終保存サイズをステータスバーに反映"""
         if self.processor.original_image is None or self.crop_rect is None:
             return
-        l, t, r, b = self.crop_rect
-        cw, ch = r - l, b - t
+        left, top, right, bottom = self.crop_rect
+        cw, ch = right - left, bottom - top
         preset_name = self.combo_ratio.get()
 
         size_key = self.combo_size.get()
@@ -551,13 +554,13 @@ class PhotoEditorApp:
                 )
                 self.canvas.tag_lower(rect_id, text_id)
 
-    def _crop_rect_in_preview(self) -> Tuple[float, float, float, float]:
+    def _crop_rect_in_preview(self) -> tuple[float, float, float, float]:
         """元画像座標のクロップ枠をプレビュー画像内の座標へ変換して返す（描画・当たり判定用）"""
         if self.crop_rect is None:
             return 0.0, 0.0, 0.0, 0.0
         s = self.preview_scale
-        l, t, r, b = self.crop_rect
-        return l * s, t * s, r * s, b * s
+        left, top, right, bottom = self.crop_rect
+        return left * s, top * s, right * s, bottom * s
 
     # --- ドラッグによるクロップ枠移動イベント ---
 
@@ -577,11 +580,11 @@ class PhotoEditorApp:
             if not (0 <= cx <= self.prev_w and 0 <= cy <= self.prev_h):
                 return
             # クリック位置（元画像座標）が枠の中心になるよう移動
-            l, t, r, b = self.crop_rect
+            left, top, right, bottom = self.crop_rect
             self.crop_rect = self.processor.move_crop_rect_to(
                 self.crop_rect,
-                int(round(cx / self.preview_scale - (r - l) / 2.0)),
-                int(round(cy / self.preview_scale - (b - t) / 2.0)),
+                int(round(cx / self.preview_scale - (right - left) / 2.0)),
+                int(round(cy / self.preview_scale - (bottom - top) / 2.0)),
             )
             self._draw_overlay()
             self._update_status_size()
@@ -601,16 +604,16 @@ class PhotoEditorApp:
         dx = int(round((cx - self.drag_start_x) / self.preview_scale))
         dy = int(round((cy - self.drag_start_y) / self.preview_scale))
 
-        l, t, _, _ = self.drag_rect_start
-        self.crop_rect = self.processor.move_crop_rect_to(self.drag_rect_start, l + dx, t + dy)
+        left, top, _, _ = self.drag_rect_start
+        self.crop_rect = self.processor.move_crop_rect_to(self.drag_rect_start, left + dx, top + dy)
         self._draw_overlay()
 
     def _on_nudge_crop(self, dx_orig: int, dy_orig: int) -> str:
         """矢印キー押下時: 元画像のピクセル単位でクロップ枠を微調整"""
         if self.crop_rect is None:
             return "break"
-        l, t, _, _ = self.crop_rect
-        self.crop_rect = self.processor.move_crop_rect_to(self.crop_rect, l + dx_orig, t + dy_orig)
+        left, top, _, _ = self.crop_rect
+        self.crop_rect = self.processor.move_crop_rect_to(self.crop_rect, left + dx_orig, top + dy_orig)
         self._draw_overlay()
         return "break"
 

@@ -1,7 +1,9 @@
 """Pillow による画像読み込み・補正・クロップ・Exif除去保存モジュール
 """
-from typing import Any, Dict, Optional, Tuple
-from PIL import Image, ImageOps, ImageEnhance
+import os
+from typing import Any
+
+from PIL import Image, ImageEnhance, ImageOps
 
 # プレビュー用キャッシュ画像の長辺上限px（4Kモニタでも十分な解像度）
 PREVIEW_CACHE_LONG_EDGE = 2560
@@ -11,23 +13,23 @@ class ImageProcessor:
     """画像の読込・色調補正・クロップ・保存を担うクラス"""
 
     def __init__(self) -> None:
-        self.original_image: Optional[Image.Image] = None
+        self.original_image: Image.Image | None = None
         # プレビュー生成用の縮小キャッシュ（毎回フル解像度から縮小しないため）
-        self.preview_base: Optional[Image.Image] = None
+        self.preview_base: Image.Image | None = None
         # 色空間情報（ICCプロファイル）。個人情報を含まないため保存時に引き継ぐ
-        self.icc_profile: Optional[bytes] = None
-        self.filepath: Optional[str] = None
+        self.icc_profile: bytes | None = None
+        self.filepath: str | None = None
         self.orig_w: int = 0
         self.orig_h: int = 0
 
-    def load_image(self, filepath: str) -> Tuple[int, int]:
+    def load_image(self, filepath: str) -> tuple[int, int]:
         """画像ファイルを読み込み、Exif向き補正を行って保持する。
 
         Args:
             filepath: 読み込む画像のファイルパス
 
         Returns:
-            Tuple[int, int]: 元画像の (幅, 高さ)
+            tuple[int, int]: 元画像の (幅, 高さ)
         """
         # with 文でファイルハンドルを確実に解放する（MPO等でのファイルロック防止）
         with Image.open(filepath) as img:
@@ -74,15 +76,15 @@ class ImageProcessor:
 
     def get_crop_size_for_preset(
         self,
-        preset_info: Optional[Tuple[str, Tuple[int, int]]],
-    ) -> Tuple[int, int]:
+        preset_info: tuple[str, tuple[int, int]] | None,
+    ) -> tuple[int, int]:
         """プリセット設定（比率または3倍ズーム枠のピクセルサイズ）に基づいて、元画像内の切り抜き枠サイズを計算する。
 
         Args:
             preset_info: ("ratio", (幅比率, 高さ比率)) または ("zoom", (幅px, 高さpx)) または None
 
         Returns:
-            Tuple[int, int]: (クロップ幅, クロップ高さ)
+            tuple[int, int]: (クロップ幅, クロップ高さ)
         """
         if self.original_image is None or self.orig_w == 0 or self.orig_h == 0:
             return 0, 0
@@ -106,14 +108,14 @@ class ImageProcessor:
 
         return self.orig_w, self.orig_h
 
-    def _fit_aspect(self, target_aspect: float) -> Tuple[int, int]:
+    def _fit_aspect(self, target_aspect: float) -> tuple[int, int]:
         """指定アスペクト比（幅/高さ）を維持して元画像内に収まる最大の枠サイズを返す。
 
         Args:
             target_aspect: 目標アスペクト比（幅 / 高さ）
 
         Returns:
-            Tuple[int, int]: (枠幅, 枠高さ)
+            tuple[int, int]: (枠幅, 枠高さ)
         """
         if self.orig_w / self.orig_h > target_aspect:
             crop_h = self.orig_h
@@ -125,15 +127,15 @@ class ImageProcessor:
 
     def get_initial_crop_rect(
         self,
-        preset_info: Optional[Tuple[str, Tuple[int, int]]],
-    ) -> Tuple[int, int, int, int]:
+        preset_info: tuple[str, tuple[int, int]] | None,
+    ) -> tuple[int, int, int, int]:
         """指定されたプリセットで、元画像の中央に配置された初期クロップ矩形を返す。
 
         Args:
             preset_info: プリセット定義
 
         Returns:
-            Tuple[int, int, int, int]: (left, top, right, bottom)
+            tuple[int, int, int, int]: (left, top, right, bottom)
         """
         crop_w, crop_h = self.get_crop_size_for_preset(preset_info)
         left = (self.orig_w - crop_w) // 2
@@ -144,17 +146,17 @@ class ImageProcessor:
 
     def adjust_crop_rect_to_aspect(
         self,
-        crop_rect: Tuple[int, int, int, int],
-        preset_info: Optional[Tuple[str, Tuple[int, int]]],
-    ) -> Tuple[int, int, int, int]:
+        crop_rect: tuple[int, int, int, int],
+        preset_info: tuple[str, tuple[int, int]] | None,
+    ) -> tuple[int, int, int, int]:
         """指定プリセットの枠サイズ (target_w, target_h) を維持し、画面内にクランプして厳密な矩形を返す。
 
         Args:
-            crop_rect: 元画像座標系での切り抜き矩形 (l, t, r, b)
+            crop_rect: 元画像座標系での切り抜き矩形 (left, top, right, bottom)
             preset_info: プリセット情報
 
         Returns:
-            Tuple[int, int, int, int]: 補正後の切り抜き矩形 (l, t, r, b)
+            tuple[int, int, int, int]: 補正後の切り抜き矩形 (left, top, right, bottom)
         """
         if preset_info is None or self.orig_w == 0 or self.orig_h == 0:
             return crop_rect
@@ -166,39 +168,39 @@ class ImageProcessor:
         # ターゲット比率での元画像内切り抜きサイズを取得
         target_w, target_h = self.get_crop_size_for_preset(preset_info)
 
-        l, t, _, _ = crop_rect
-        l = max(0, min(self.orig_w - target_w, l))
-        t = max(0, min(self.orig_h - target_h, t))
-        return l, t, l + target_w, t + target_h
+        left, top, _, _ = crop_rect
+        left = max(0, min(self.orig_w - target_w, left))
+        top = max(0, min(self.orig_h - target_h, top))
+        return left, top, left + target_w, top + target_h
 
     def move_crop_rect_to(
         self,
-        crop_rect: Tuple[int, int, int, int],
-        left: int,
-        top: int,
-    ) -> Tuple[int, int, int, int]:
+        crop_rect: tuple[int, int, int, int],
+        new_left: int,
+        new_top: int,
+    ) -> tuple[int, int, int, int]:
         """切り抜き枠のサイズを維持したまま左上を指定位置へ移動し、元画像内にクランプして返す。
 
         Args:
-            crop_rect: 元画像座標系での現在の切り抜き矩形 (l, t, r, b)
-            left: 移動先の左端 (元画像px)
-            top: 移動先の上端 (元画像px)
+            crop_rect: 元画像座標系での現在の切り抜き矩形 (left, top, right, bottom)
+            new_left: 移動先の左端 (元画像px)
+            new_top: 移動先の上端 (元画像px)
 
         Returns:
-            Tuple[int, int, int, int]: 移動後の切り抜き矩形 (l, t, r, b)
+            tuple[int, int, int, int]: 移動後の切り抜き矩形 (left, top, right, bottom)
         """
-        l, t, r, b = crop_rect
-        w, h = r - l, b - t
-        new_l = max(0, min(self.orig_w - w, int(left)))
-        new_t = max(0, min(self.orig_h - h, int(top)))
-        return new_l, new_t, new_l + w, new_t + h
+        left, top, right, bottom = crop_rect
+        w, h = right - left, bottom - top
+        clamped_left = max(0, min(self.orig_w - w, int(new_left)))
+        clamped_top = max(0, min(self.orig_h - h, int(new_top)))
+        return clamped_left, clamped_top, clamped_left + w, clamped_top + h
 
     @staticmethod
     def calc_output_size(
         crop_w: int,
         crop_h: int,
-        max_long_edge: Optional[int],
-    ) -> Tuple[int, int]:
+        max_long_edge: int | None,
+    ) -> tuple[int, int]:
         """切り抜き枠サイズと長辺上限設定から、最終保存サイズ (幅, 高さ) を算出する。
 
         Args:
@@ -207,7 +209,7 @@ class ImageProcessor:
             max_long_edge: 出力画像の長辺上限px (Noneの場合は縮小なし)
 
         Returns:
-            Tuple[int, int]: 最終保存画像の (幅, 高さ)
+            tuple[int, int]: 最終保存画像の (幅, 高さ)
         """
         if crop_w <= 0 or crop_h <= 0:
             return 0, 0
@@ -221,15 +223,14 @@ class ImageProcessor:
             return new_w, new_h
         return crop_w, crop_h
 
-
     def get_preview_image(
         self,
-        max_size: Tuple[int, int] = (620, 560),
+        max_size: tuple[int, int] = (620, 560),
         brightness: float = 1.0,
         contrast: float = 1.0,
         color: float = 1.0,
         apply_adjustments: bool = False,
-    ) -> Tuple[Optional[Image.Image], float, int, int]:
+    ) -> tuple[Image.Image | None, float, int, int]:
         """Canvasプレビュー用の縮小画像とスケール比率を生成する。
 
         Args:
@@ -240,7 +241,8 @@ class ImageProcessor:
             apply_adjustments: 色調補正を適用するかどうか
 
         Returns:
-            Tuple[Image, float, int, int]: (プレビュー画像, 元画像からのスケール係数, プレビュー幅, プレビュー高さ)
+            tuple[Image.Image | None, float, int, int]:
+                (プレビュー画像, 元画像からのスケール係数, プレビュー幅, プレビュー高さ)
         """
         if self.original_image is None:
             return None, 1.0, 0, 0
@@ -291,13 +293,13 @@ class ImageProcessor:
     def save_cropped_image(
         self,
         output_path: str,
-        crop_rect: Tuple[int, int, int, int],
+        crop_rect: tuple[int, int, int, int],
         brightness: float = 1.0,
         contrast: float = 1.0,
         color: float = 1.0,
         quality: int = 90,
-        max_long_edge: Optional[int] = 1080,
-    ) -> Tuple[int, int]:
+        max_long_edge: int | None = 1080,
+    ) -> tuple[int, int]:
         """元解像度の切り抜き・色調補正・SNS向け縮小を行い、Exifを完全除去して別名保存する。
 
         Args:
@@ -310,20 +312,25 @@ class ImageProcessor:
             max_long_edge: 出力画像の長辺上限px (Noneの場合は縮小なし)
 
         Returns:
-            Tuple[int, int]: 最終保存画像の (幅, 高さ)
+            tuple[int, int]: 最終保存画像の (幅, 高さ)
         """
         if self.original_image is None:
             raise ValueError("画像が読み込まれていません。")
 
+        # 出力ディレクトリが存在しない場合は作成
+        out_dir = os.path.dirname(os.path.abspath(output_path))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
         # 元画像の座標範囲に収まるようクランプ
-        l, t, r, b = crop_rect
-        l = max(0, min(self.orig_w - 1, l))
-        t = max(0, min(self.orig_h - 1, t))
-        r = max(l + 1, min(self.orig_w, r))
-        b = max(t + 1, min(self.orig_h, b))
+        left, top, right, bottom = crop_rect
+        left = max(0, min(self.orig_w - 1, left))
+        top = max(0, min(self.orig_h - 1, top))
+        right = max(left + 1, min(self.orig_w, right))
+        bottom = max(top + 1, min(self.orig_h, bottom))
 
         # 1. 元解像度のまま切り抜き
-        cropped = self.original_image.crop((l, t, r, b))
+        cropped = self.original_image.crop((left, top, right, bottom))
 
         # 2. 色調補正の適用
         adjusted = self.apply_adjustments(cropped, brightness, contrast, color)
@@ -344,7 +351,7 @@ class ImageProcessor:
         clean_img.paste(adjusted)
 
         # 5. JPEG保存（Exifは含めず、色再現のためICCプロファイルのみ引き継ぐ）
-        save_kwargs: Dict[str, Any] = {"quality": quality, "optimize": True}
+        save_kwargs: dict[str, Any] = {"quality": quality, "optimize": True}
         if self.icc_profile:
             save_kwargs["icc_profile"] = self.icc_profile
         clean_img.save(output_path, format="JPEG", **save_kwargs)

@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 import pytest
-from PIL import Image, ImageCms
+from PIL import Image, ImageCms, UnidentifiedImageError
 
 from src.image_processor import PREVIEW_CACHE_LONG_EDGE, ImageProcessor
 
@@ -102,7 +102,7 @@ class TestLoadImage:
     def test_invalid_file_raises(self, processor, tmp_path):
         path = tmp_path / "broken.jpg"
         path.write_bytes(b"not an image")
-        with pytest.raises(Exception):
+        with pytest.raises((UnidentifiedImageError, OSError)):
             processor.load_image(str(path))
 
 
@@ -146,9 +146,9 @@ class TestAdjustCropRect:
     def test_keeps_size_and_clamps_inside(self, loaded):
         p = loaded((4000, 3000))
         # はみ出した位置・丸め誤差のあるサイズを渡しても、規定サイズで画像内に収まる
-        l, t, r, b = p.adjust_crop_rect_to_aspect((3500, -10, 6501, 2999), ("ratio", (1, 1)))
-        assert (r - l, b - t) == (3000, 3000)
-        assert (l, t) == (1000, 0)
+        left, top, right, bottom = p.adjust_crop_rect_to_aspect((3500, -10, 6501, 2999), ("ratio", (1, 1)))
+        assert (right - left, bottom - top) == (3000, 3000)
+        assert (left, top) == (1000, 0)
 
     def test_none_preset_returns_as_is(self, loaded):
         rect = (10, 20, 110, 220)
@@ -183,8 +183,8 @@ class TestMoveCropRect:
         p = loaded((4032, 3024))
         rect = p.get_initial_crop_rect(("ratio", (1, 1)))
         for _ in range(100):
-            l, t, _, _ = rect
-            rect = p.move_crop_rect_to(rect, l + 1, t)
+            left, top, _, _ = rect
+            rect = p.move_crop_rect_to(rect, left + 1, top)
         assert rect == (504 + 100, 0, 504 + 100 + 3024, 3024)
 
 

@@ -15,8 +15,17 @@ extraPaths = ["."]
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "ruff>=0.8.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "B", "UP", "I"]
+ignore = ["E501"]  # 長いコメント行などの過度なエラーを抑止
