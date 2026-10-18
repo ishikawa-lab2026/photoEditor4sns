@@ -155,6 +155,39 @@ class TestAdjustCropRect:
         assert loaded().adjust_crop_rect_to_aspect(rect, None) == rect
 
 
+class TestMoveCropRect:
+    def test_moves_keeping_size(self, loaded):
+        p = loaded((4000, 3000))
+        assert p.move_crop_rect_to((500, 0, 3500, 3000), 501, 0) == (501, 0, 3501, 3000)
+
+    @pytest.mark.parametrize(
+        "left, top, expected",
+        [
+            (-100, -100, (0, 0, 1000, 1000)),
+            (9999, 9999, (3000, 2000, 4000, 3000)),
+        ],
+    )
+    def test_clamped_inside_image(self, loaded, left, top, expected):
+        p = loaded((4000, 3000))
+        assert p.move_crop_rect_to((100, 100, 1100, 1100), left, top) == expected
+
+    def test_full_image_cannot_move(self, loaded):
+        """フリー（元画像全体）の枠は移動しても元解像度のまま変わらない"""
+        p = loaded((4032, 3024))
+        full = p.get_initial_crop_rect(None)
+        assert full == (0, 0, 4032, 3024)
+        assert p.move_crop_rect_to(full, 7, 7) == full
+
+    def test_repeated_nudge_is_exact(self, loaded):
+        """1px移動を繰り返しても丸め誤差が蓄積しない"""
+        p = loaded((4032, 3024))
+        rect = p.get_initial_crop_rect(("ratio", (1, 1)))
+        for _ in range(100):
+            l, t, _, _ = rect
+            rect = p.move_crop_rect_to(rect, l + 1, t)
+        assert rect == (504 + 100, 0, 504 + 100 + 3024, 3024)
+
+
 # ---------------------------------------------------------------------------
 # 出力サイズ計算（仕様書の仕上がりサイズと一致すること）
 # ---------------------------------------------------------------------------

@@ -76,10 +76,10 @@ class ImageProcessor:
         self,
         preset_info: Optional[Tuple[str, Tuple[int, int]]],
     ) -> Tuple[int, int]:
-        """プリセット設定（比率または推奨固定ピクセルサイズ）に基づいて、元画像内の切り抜き枠サイズを計算する。
+        """プリセット設定（比率または3倍ズーム枠のピクセルサイズ）に基づいて、元画像内の切り抜き枠サイズを計算する。
 
         Args:
-            preset_info: ("ratio", (幅比率, 高さ比率)) または ("fixed", (幅px, 高さpx)) または None
+            preset_info: ("ratio", (幅比率, 高さ比率)) または ("zoom", (幅px, 高さpx)) または None
 
         Returns:
             Tuple[int, int]: (クロップ幅, クロップ高さ)
@@ -91,51 +91,37 @@ class ImageProcessor:
             # フリー / 元画像全体
             return self.orig_w, self.orig_h
 
-        mode, values = preset_info
+        mode, (target_w, target_h) = preset_info
 
         if mode == "zoom":
             # 3倍ズーム枠（指定ピクセルサイズ）
-            target_w, target_h = values
             # 元画像の幅または高さが指定ピクセルより小さい場合は、比率を維持して元画像内に収まる最大枠へ安全クランプ
             if target_w > self.orig_w or target_h > self.orig_h:
-                target_aspect = target_w / target_h
-                current_aspect = self.orig_w / self.orig_h
-                if current_aspect > target_aspect:
-                    crop_h = self.orig_h
-                    crop_w = int(round(crop_h * target_aspect))
-                else:
-                    crop_w = self.orig_w
-                    crop_h = int(round(crop_w / target_aspect))
-                crop_w = min(self.orig_w, max(1, crop_w))
-                crop_h = min(self.orig_h, max(1, crop_h))
-                return crop_w, crop_h
+                return self._fit_aspect(target_w / target_h)
             return target_w, target_h
 
-        elif mode == "fixed":
-            # SNS推奨固定ピクセルサイズ（元画像サイズを上限にクランプ）
-            target_w, target_h = values
-            crop_w = min(self.orig_w, target_w)
-            crop_h = min(self.orig_h, target_h)
-            return crop_w, crop_h
-
-        elif mode == "ratio":
+        if mode == "ratio":
             # アスペクト比に基づく元画像内最大サイズ
-            target_w_ratio, target_h_ratio = values
-            target_aspect = target_w_ratio / target_h_ratio
-            current_aspect = self.orig_w / self.orig_h
-
-            if current_aspect > target_aspect:
-                crop_h = self.orig_h
-                crop_w = int(round(crop_h * target_aspect))
-            else:
-                crop_w = self.orig_w
-                crop_h = int(round(crop_w / target_aspect))
-
-            crop_w = min(self.orig_w, max(1, crop_w))
-            crop_h = min(self.orig_h, max(1, crop_h))
-            return crop_w, crop_h
+            return self._fit_aspect(target_w / target_h)
 
         return self.orig_w, self.orig_h
+
+    def _fit_aspect(self, target_aspect: float) -> Tuple[int, int]:
+        """指定アスペクト比（幅/高さ）を維持して元画像内に収まる最大の枠サイズを返す。
+
+        Args:
+            target_aspect: 目標アスペクト比（幅 / 高さ）
+
+        Returns:
+            Tuple[int, int]: (枠幅, 枠高さ)
+        """
+        if self.orig_w / self.orig_h > target_aspect:
+            crop_h = self.orig_h
+            crop_w = int(round(crop_h * target_aspect))
+        else:
+            crop_w = self.orig_w
+            crop_h = int(round(crop_w / target_aspect))
+        return min(self.orig_w, max(1, crop_w)), min(self.orig_h, max(1, crop_h))
 
     def get_initial_crop_rect(
         self,
@@ -184,6 +170,28 @@ class ImageProcessor:
         l = max(0, min(self.orig_w - target_w, l))
         t = max(0, min(self.orig_h - target_h, t))
         return l, t, l + target_w, t + target_h
+
+    def move_crop_rect_to(
+        self,
+        crop_rect: Tuple[int, int, int, int],
+        left: int,
+        top: int,
+    ) -> Tuple[int, int, int, int]:
+        """切り抜き枠のサイズを維持したまま左上を指定位置へ移動し、元画像内にクランプして返す。
+
+        Args:
+            crop_rect: 元画像座標系での現在の切り抜き矩形 (l, t, r, b)
+            left: 移動先の左端 (元画像px)
+            top: 移動先の上端 (元画像px)
+
+        Returns:
+            Tuple[int, int, int, int]: 移動後の切り抜き矩形 (l, t, r, b)
+        """
+        l, t, r, b = crop_rect
+        w, h = r - l, b - t
+        new_l = max(0, min(self.orig_w - w, int(left)))
+        new_t = max(0, min(self.orig_h - h, int(top)))
+        return new_l, new_t, new_l + w, new_t + h
 
     @staticmethod
     def calc_output_size(
@@ -330,6 +338,8 @@ class ImageProcessor:
         final_w, final_h = adjusted.size
 
         # 4. Exifメタデータを完全除去するため、新規RGBプレーン画像を作成して転送
+        #    （Pillow の JPEG 保存は save() の引数のみ参照し img.info の exif は書き込まないが、
+        #     将来の Pillow 仕様変更に備えてメタデータを持たない画像から保存する）
         clean_img = Image.new("RGB", (final_w, final_h))
         clean_img.paste(adjusted)
 

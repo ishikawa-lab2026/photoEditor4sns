@@ -35,14 +35,14 @@ class PhotoEditorApp:
         self.img_offset_x: int = 0
         self.img_offset_y: int = 0
 
-        # クロップ枠（プレビュー画像内の座標: px）
-        # (left, top, right, bottom)
-        self.crop_box: Optional[Tuple[float, float, float, float]] = None
+        # クロップ枠（元画像座標系の整数px）: (left, top, right, bottom)
+        # プレビュー座標は描画時にのみ算出し、丸め誤差の蓄積を防ぐ
+        self.crop_rect: Optional[Tuple[int, int, int, int]] = None
 
-        # ドラッグ移動管理
+        # ドラッグ移動管理（開始位置はプレビュー座標、開始時の枠は元画像座標）
         self.drag_start_x: float = 0.0
         self.drag_start_y: float = 0.0
-        self.drag_box_orig: Optional[Tuple[float, float, float, float]] = None
+        self.drag_rect_start: Optional[Tuple[int, int, int, int]] = None
         self.is_dragging: bool = False
 
         # プレビューに適用済みの補正値 (明るさ, コントラスト, 彩度: -1.00〜1.00, 基準 0.00)
@@ -321,6 +321,8 @@ class PhotoEditorApp:
 
             # リセットして初期中央枠配置
             self._reset_all_params()
+            # 読込直後から矢印キーで微調整できるようCanvasにフォーカスを移す
+            self.canvas.focus_set()
             self.lbl_status.config(text=f"「{filename}」を読み込みました。比率選択やドラッグで位置を合わせてください。")
         except Exception as e:
             messagebox.showerror("エラー", f"画像の読み込みに失敗しました:\n{e}")
@@ -342,32 +344,17 @@ class PhotoEditorApp:
         default_size_key = PRESET_DEFAULT_OUTPUT_SIZE.get(preset_name, list(OUTPUT_SIZE_PRESETS.keys())[0])
         self.combo_size.set(default_size_key)
 
-        # クロップ枠を破棄し、描画時（新しいプレビュースケール確定後）に中央へ再配置させる
-        self.crop_box = None
+        # クロップ枠を現在のプリセットで中央に再配置
+        self._recalc_initial_crop_rect()
         self._render_canvas()
         self._update_status_size()
 
-    def _recalc_initial_crop_box(self) -> None:
-        """現在の選択プリセットに基づいてプレビュー内の中央クロップ枠を計算"""
-        if self.processor.original_image is None or self.prev_w == 0 or self.prev_h == 0:
+    def _recalc_initial_crop_rect(self) -> None:
+        """現在の選択プリセットに基づいて元画像中央のクロップ枠を設定"""
+        if self.processor.original_image is None:
             return
-
-        preset_key = self.combo_ratio.get()
-        preset_info = CROP_PRESETS.get(preset_key, None)
-
-        if preset_info is None:
-            # フリー / 元画像全体: プレビュー画像全体
-            self.crop_box = (0.0, 0.0, float(self.prev_w), float(self.prev_h))
-        else:
-            orig_crop_w, orig_crop_h = self.processor.get_crop_size_for_preset(preset_info)
-            # 元画像のクロップサイズをプレビュー座標系にスケール変換
-            # （プレビュー寸法は整数丸めされるため、枠がはみ出さないよう上限をかける）
-            prev_box_w = min(orig_crop_w * self.preview_scale, float(self.prev_w))
-            prev_box_h = min(orig_crop_h * self.preview_scale, float(self.prev_h))
-
-            left = (self.prev_w - prev_box_w) / 2.0
-            top = (self.prev_h - prev_box_h) / 2.0
-            self.crop_box = (left, top, left + prev_box_w, top + prev_box_h)
+        preset_info = CROP_PRESETS.get(self.combo_ratio.get())
+        self.crop_rect = self.processor.get_initial_crop_rect(preset_info)
 
     def _on_ratio_changed(self, event=None) -> None:
         """クロッププリセットコンボボックス変更時の処理（出力サイズを自動連動）"""
@@ -381,7 +368,7 @@ class PhotoEditorApp:
         if default_size_key and default_size_key in OUTPUT_SIZE_PRESETS:
             self.combo_size.set(default_size_key)
 
-        self._recalc_initial_crop_box()
+        self._recalc_initial_crop_rect()
         self._draw_overlay()
         self._update_status_size()
 
@@ -393,16 +380,11 @@ class PhotoEditorApp:
 
     def _update_status_size(self) -> None:
         """現在の切り抜きサイズと最終保存サイズをステータスバーに反映"""
-        if self.processor.original_image is None or self.crop_box is None or self.preview_scale <= 0:
+        if self.processor.original_image is None or self.crop_rect is None:
             return
-        cl, ct, cr, cb = self.crop_box
-        orig_w = int(round((cr - cl) / self.preview_scale))
-        orig_h = int(round((cb - ct) / self.preview_scale))
-
-        preset_name = self.combo_ratio.get()
-        preset_info = CROP_PRESETS.get(preset_name)
-        l, t, r, b = self.processor.adjust_crop_rect_to_aspect((0, 0, orig_w, orig_h), preset_info)
+        l, t, r, b = self.crop_rect
         cw, ch = r - l, b - t
+        preset_name = self.combo_ratio.get()
 
         size_key = self.combo_size.get()
         max_edge = OUTPUT_SIZE_PRESETS.get(size_key)
@@ -455,12 +437,6 @@ class PhotoEditorApp:
         max_pw = max(50, canvas_w - 20)
         max_ph = max(50, canvas_h - 20)
 
-        # 既存クロップ枠の正規化比率を保存（リサイズ追従用）
-        norm_box = None
-        if self.crop_box is not None and self.prev_w > 0 and self.prev_h > 0:
-            l, t, r, b = self.crop_box
-            norm_box = (l / self.prev_w, t / self.prev_h, r / self.prev_w, b / self.prev_h)
-
         bright_ui, contrast_ui, color_ui = self.applied_adj
 
         prev_img, scale, pw, ph = self.processor.get_preview_image(
@@ -481,12 +457,9 @@ class PhotoEditorApp:
 
         self.preview_tk_image = ImageTk.PhotoImage(prev_img)
 
-        # クロップ枠のスケール再設定
-        if norm_box is not None:
-            nl, nt, nr, nb = norm_box
-            self.crop_box = (nl * pw, nt * ph, nr * pw, nb * ph)
-        else:
-            self._recalc_initial_crop_box()
+        # クロップ枠は元画像座標で保持しているため、リサイズ時の再計算は不要
+        if self.crop_rect is None:
+            self._recalc_initial_crop_rect()
 
         # Canvas要素の描画
         self.canvas.delete("all")
@@ -501,10 +474,10 @@ class PhotoEditorApp:
     def _draw_overlay(self) -> None:
         """クロップ枠、3分割構図線、枠外シャドウのCanvas描画"""
         self.canvas.delete("crop_overlay")
-        if self.crop_box is None or self.prev_w == 0 or self.prev_h == 0:
+        if self.crop_rect is None or self.prev_w == 0 or self.prev_h == 0:
             return
 
-        cl, ct, cr, cb = self.crop_box
+        cl, ct, cr, cb = self._crop_rect_in_preview()
         ox = self.img_offset_x
         oy = self.img_offset_y
 
@@ -549,13 +522,9 @@ class PhotoEditorApp:
 
         # 4. クロップ枠の元画像実サイズと最終保存サイズバッジ表示
         if self.preview_scale > 0:
-            actual_w = int(round((cr - cl) / self.preview_scale))
-            actual_h = int(round((cb - ct) / self.preview_scale))
-
-            # アスペクト比厳密補正
-            preset_name = self.combo_ratio.get()
-            preset_info = CROP_PRESETS.get(preset_name)
-            _, _, adj_w, adj_h = self.processor.adjust_crop_rect_to_aspect((0, 0, actual_w, actual_h), preset_info)
+            # 元画像座標の枠サイズをそのまま使う（逆変換による丸め誤差なし）
+            rl, rt, rr, rb = self.crop_rect
+            adj_w, adj_h = rr - rl, rb - rt
 
             # 最終出力サイズの算出
             size_key = self.combo_size.get()
@@ -582,78 +551,79 @@ class PhotoEditorApp:
                 )
                 self.canvas.tag_lower(rect_id, text_id)
 
+    def _crop_rect_in_preview(self) -> Tuple[float, float, float, float]:
+        """元画像座標のクロップ枠をプレビュー画像内の座標へ変換して返す（描画・当たり判定用）"""
+        if self.crop_rect is None:
+            return 0.0, 0.0, 0.0, 0.0
+        s = self.preview_scale
+        l, t, r, b = self.crop_rect
+        return l * s, t * s, r * s, b * s
+
     # --- ドラッグによるクロップ枠移動イベント ---
 
     def _on_drag_start(self, event) -> None:
         """マウスクリック時: ドラッグ開始（枠外クリック時はその位置へ枠の中心を移動）"""
         # 矢印キーによる微調整を受け付けるためCanvasにフォーカスを移す
         self.canvas.focus_set()
-        if self.crop_box is None:
+        if self.crop_rect is None or self.preview_scale <= 0:
             return
 
         cx = event.x - self.img_offset_x
         cy = event.y - self.img_offset_y
-        cl, ct, cr, cb = self.crop_box
+        cl, ct, cr, cb = self._crop_rect_in_preview()
 
         if not (cl <= cx <= cr and ct <= cy <= cb):
             # 画像範囲外のクリックは無視
             if not (0 <= cx <= self.prev_w and 0 <= cy <= self.prev_h):
                 return
-            box_w = cr - cl
-            box_h = cb - ct
-            self._move_crop_to(cx - box_w / 2.0, cy - box_h / 2.0)
+            # クリック位置（元画像座標）が枠の中心になるよう移動
+            l, t, r, b = self.crop_rect
+            self.crop_rect = self.processor.move_crop_rect_to(
+                self.crop_rect,
+                int(round(cx / self.preview_scale - (r - l) / 2.0)),
+                int(round(cy / self.preview_scale - (b - t) / 2.0)),
+            )
             self._draw_overlay()
+            self._update_status_size()
 
         self.is_dragging = True
         self.drag_start_x = cx
         self.drag_start_y = cy
-        self.drag_box_orig = self.crop_box
+        self.drag_rect_start = self.crop_rect
 
     def _on_drag_motion(self, event) -> None:
-        """ドラッグ中: クロップ枠を画像表示範囲内に制限しながら移動"""
-        if not self.is_dragging or self.drag_box_orig is None:
+        """ドラッグ中: マウス移動量を元画像pxに換算し、元画像範囲内に制限しながら枠を移動"""
+        if not self.is_dragging or self.drag_rect_start is None or self.preview_scale <= 0:
             return
 
         cx = event.x - self.img_offset_x
         cy = event.y - self.img_offset_y
+        dx = int(round((cx - self.drag_start_x) / self.preview_scale))
+        dy = int(round((cy - self.drag_start_y) / self.preview_scale))
 
-        dx = cx - self.drag_start_x
-        dy = cy - self.drag_start_y
-
-        orig_l, orig_t, _, _ = self.drag_box_orig
-        self._move_crop_to(orig_l + dx, orig_t + dy)
+        l, t, _, _ = self.drag_rect_start
+        self.crop_rect = self.processor.move_crop_rect_to(self.drag_rect_start, l + dx, t + dy)
         self._draw_overlay()
-
-    def _move_crop_to(self, new_l: float, new_t: float) -> None:
-        """クロップ枠を指定位置へ移動（プレビュー画像範囲内にクランプ）"""
-        if self.crop_box is None:
-            return
-        cl, ct, cr, cb = self.crop_box
-        box_w = cr - cl
-        box_h = cb - ct
-        new_l = max(0.0, min(float(self.prev_w - box_w), new_l))
-        new_t = max(0.0, min(float(self.prev_h - box_h), new_t))
-        self.crop_box = (new_l, new_t, new_l + box_w, new_t + box_h)
 
     def _on_nudge_crop(self, dx_orig: int, dy_orig: int) -> str:
         """矢印キー押下時: 元画像のピクセル単位でクロップ枠を微調整"""
-        if self.crop_box is None or self.preview_scale <= 0:
+        if self.crop_rect is None:
             return "break"
-        cl, ct, _, _ = self.crop_box
-        self._move_crop_to(cl + dx_orig * self.preview_scale, ct + dy_orig * self.preview_scale)
+        l, t, _, _ = self.crop_rect
+        self.crop_rect = self.processor.move_crop_rect_to(self.crop_rect, l + dx_orig, t + dy_orig)
         self._draw_overlay()
         return "break"
 
     def _on_drag_end(self, event) -> None:
         """ドラッグ終了"""
         self.is_dragging = False
-        self.drag_box_orig = None
+        self.drag_rect_start = None
 
     # --- 保存処理 ---
 
     def _on_save_image(self) -> None:
         """「別名で保存」ボタン押下時: Exif除去・元解像度クロップ別名保存"""
-        if self.processor.original_image is None or self.crop_box is None:
+        if self.processor.original_image is None or self.crop_rect is None:
             messagebox.showwarning("警告", "保存対象の写真がありません。")
             return
 
@@ -686,19 +656,28 @@ class PhotoEditorApp:
         if not save_path:
             return
 
-        try:
-            # プレビュー上の crop_box を元画像座標系に変換
-            cl, ct, cr, cb = self.crop_box
-            orig_left = int(round(cl / self.preview_scale))
-            orig_top = int(round(ct / self.preview_scale))
-            orig_right = int(round(cr / self.preview_scale))
-            orig_bottom = int(round(cb / self.preview_scale))
+        # JPEG以外の拡張子が入力された場合は .jpg を付与（中身と拡張子の不一致を防ぐ）
+        if os.path.splitext(save_path)[1].lower() not in (".jpg", ".jpeg"):
+            save_path += ".jpg"
+            # 付与後の名前はダイアログの上書き確認を経ていないため、ここで確認する
+            if os.path.exists(save_path) and not messagebox.askyesno(
+                "上書きの確認", f"{os.path.basename(save_path)} は既に存在します。\n上書きしますか？"
+            ):
+                return
 
-            raw_rect = (orig_left, orig_top, orig_right, orig_bottom)
-            # アスペクト比の厳密補正（微小な丸め誤差を除去）
-            preset_name = self.combo_ratio.get()
-            preset_info = CROP_PRESETS.get(preset_name)
-            crop_rect = self.processor.adjust_crop_rect_to_aspect(raw_rect, preset_info)
+        # 元画像への誤上書きを防止
+        if self.processor.filepath and self._same_path(save_path, self.processor.filepath):
+            messagebox.showwarning(
+                "保存できません",
+                "元画像と同じファイルには保存できません。\n別のファイル名を指定してください。",
+            )
+            return
+
+        self.root.config(cursor="watch")
+        self.root.update_idletasks()
+        try:
+            # クロップ枠は元画像座標で保持しているため、そのまま渡す
+            crop_rect = self.crop_rect
             # 保存はプレビューと同じ「適用済み」の補正値で行う（UI値 -> Pillow倍率に変換）
             bright_ui, contrast_ui, color_ui = self.applied_adj
             quality = int(float(self.scale_quality.get()))
@@ -717,6 +696,7 @@ class PhotoEditorApp:
                 max_long_edge=max_long_edge,
             )
 
+            self.root.config(cursor="")
             saved_name = os.path.basename(save_path)
             self.lbl_status.config(text=f"保存完了: {saved_name} ({final_w}×{final_h} px, Exif除去済)")
             messagebox.showinfo(
@@ -729,4 +709,10 @@ class PhotoEditorApp:
                 f"・品質: {quality}",
             )
         except Exception as e:
+            self.root.config(cursor="")
             messagebox.showerror("エラー", f"画像の保存に失敗しました:\n{e}")
+
+    @staticmethod
+    def _same_path(a: str, b: str) -> bool:
+        """2つのパスが同一ファイルを指すか（Windowsの大文字小文字・区切り文字の違いを吸収）"""
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
